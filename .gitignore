@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# direnv
+.direnv/
+.envrc.local
+
+# Nix
+result
+result-*
+
+# Local-only / temporary
+*.local
+scratch/
+TODO.local.md
