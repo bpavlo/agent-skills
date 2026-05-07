@@ -1,0 +1,41 @@
+{
+  "name": "agent-skills",
+  "version": "0.1.0",
+  "description": "Personal skills for AI coding agents (Claude Code, opencode)",
+  "type": "module",
+  "bin": {
+    "agent-skills": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node ./bin/cli.js --help"
+  },
+  "license": "MIT",
+  "author": "Pavlo B",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bpavlo/agent-skills.git"
+  },
+  "homepage": "https://github.com/bpavlo/agent-skills#readme",
+  "bugs": "https://github.com/bpavlo/agent-skills/issues",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "opencode",
+    "agent",
+    "skills",
+    "ai"
+  ],
+  "files": [
+    "bin/",
+    "*/SKILL.md",
+    "*/use_cases.yaml",
+    "*/references/**",
+    "*/scripts/**",
+    "*/templates/**",
+    "README.md",
+    "LICENSE"
+  ]
+}
