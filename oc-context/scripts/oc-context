@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""oc-context — surface prior opencode sessions as context for AI agents.
+
+Read-only digest over `~/.local/share/opencode/storage/`. No external deps.
+Designed so a future `semantic` subcommand can reuse `walk_sessions()` and
+`load_session_text()` against a vector index.
+
+Layout reference:
+    project/<projectID>.json
+    session/<projectID>/<ses_*>.json
+    message/<ses_*>/<msg_*>.json
+    part/<msg_*>/<prt_*>.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator
+
+
+def storage_root() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(xdg) / "opencode" / "storage"
+
+
+@dataclass
+class Project:
+    id: str
+    worktree: str
+    created: int = 0
+    updated: int = 0
+
+
+@dataclass
+class Session:
+    id: str
+    project_id: str
+    worktree: str
+    title: str
+    slug: str
+    created: int
+    updated: int
+    additions: int = 0
+    deletions: int = 0
+    files: int = 0
+
+    @property
+    def created_iso(self) -> str:
+        return _iso(self.created)
+
+    @property
+    def updated_iso(self) -> str:
+        return _iso(self.updated)
+
+
+@dataclass
+class MessageSummary:
+    session_id: str
+    message_id: str
+    role: str
+    title: str = ""
+    files: list[str] = field(default_factory=list)
+    created: int = 0
+
+
+def _iso(ms: int) -> str:
+    if not ms:
+        return ""
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_projects(root: Path) -> dict[str, Project]:
+    out: dict[str, Project] = {}
+    proj_dir = root / "project"
+    if not proj_dir.is_dir():
+        return out
+    for f in proj_dir.glob("*.json"):
+        d = _load_json(f)
+        if not d:
+            continue
+        pid = d.get("id") or f.stem
+        out[pid] = Project(
+            id=pid,
+            worktree=d.get("worktree", ""),
+            created=(d.get("time") or {}).get("created", 0),
+            updated=(d.get("time") or {}).get("updated", 0),
+        )
+    return out
+
+
+def walk_sessions(root: Path, projects: dict[str, Project]) -> Iterator[Session]:
+    sess_root = root / "session"
+    if not sess_root.is_dir():
+        return
+    for proj_dir in sess_root.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        proj = projects.get(proj_dir.name)
+        worktree = proj.worktree if proj else proj_dir.name
+        for sf in proj_dir.glob("ses_*.json"):
+            d = _load_json(sf)
+            if not d:
+                continue
+            t = d.get("time") or {}
+            s = d.get("summary")
+            if not isinstance(s, dict):
+                s = {}
+            yield Session(
+                id=d.get("id") or sf.stem,
+                project_id=d.get("projectID", proj_dir.name),
+                worktree=d.get("directory") or worktree,
+                title=d.get("title", "") or "",
+                slug=d.get("slug", "") or "",
+                created=t.get("created", 0),
+                updated=t.get("updated", 0),
+                additions=s.get("additions", 0),
+                deletions=s.get("deletions", 0),
+                files=s.get("files", 0),
+            )
+
+
+def load_messages(root: Path, session_id: str) -> list[MessageSummary]:
+    mdir = root / "message" / session_id
+    if not mdir.is_dir():
+        return []
+    out: list[MessageSummary] = []
+    for mf in mdir.glob("msg_*.json"):
+        d = _load_json(mf)
+        if not d:
+            continue
+        summary = d.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        files = []
+        for diff in summary.get("diffs") or []:
+            f = diff.get("file")
+            if f:
+                files.append(f)
+        out.append(
+            MessageSummary(
+                session_id=session_id,
+                message_id=d.get("id") or mf.stem,
+                role=d.get("role", ""),
+                title=summary.get("title", "") or "",
+                files=files,
+                created=(d.get("time") or {}).get("created", 0),
+            )
+        )
+    out.sort(key=lambda m: m.created)
+    return out
+
+
+def iter_part_texts(root: Path, message_id: str) -> Iterator[tuple[str, str]]:
+    """Yield (type, text) tuples for a message's parts. Includes text, reasoning,
+    and patch file lists; skips heavy tool output by default."""
+    pdir = root / "part" / message_id
+    if not pdir.is_dir():
+        return
+    for pf in sorted(pdir.glob("prt_*.json")):
+        d = _load_json(pf)
+        if not d:
+            continue
+        t = d.get("type", "")
+        if t == "text":
+            yield t, d.get("text", "") or ""
+        elif t == "reasoning":
+            yield t, d.get("text", "") or ""
+        elif t == "patch":
+            files = d.get("files") or []
+            if files:
+                yield t, "patched: " + ", ".join(files)
+
+
+def session_text_blob(root: Path, session_id: str, include_reasoning: bool = False) -> str:
+    """Concatenated message + part text for a session. Used by search."""
+    chunks: list[str] = []
+    for msg in load_messages(root, session_id):
+        if msg.title:
+            chunks.append(msg.title)
+        for typ, txt in iter_part_texts(root, msg.message_id):
+            if typ == "reasoning" and not include_reasoning:
+                continue
+            chunks.append(txt)
+    return "\n".join(chunks)
+
+
+# ---------- commands ----------
+
+
+def filter_by_cwd(sessions: list[Session], cwd: str) -> list[Session]:
+    cwd = str(Path(cwd).resolve())
+    return [s for s in sessions if s.worktree == cwd]
+
+
+def filter_since(sessions: list[Session], days: int) -> list[Session]:
+    if days <= 0:
+        return sessions
+    cutoff = (datetime.now().timestamp() - days * 86400) * 1000
+    return [s for s in sessions if s.updated >= cutoff]
+
+
+def _print_human(sessions: list[Session], show_worktree: bool) -> None:
+    if not sessions:
+        print("(no sessions)")
+        return
+    by_proj: dict[str, list[Session]] = {}
+    for s in sessions:
+        by_proj.setdefault(s.worktree or "?", []).append(s)
+    for worktree in sorted(by_proj, key=lambda k: max(s.updated for s in by_proj[k]), reverse=True):
+        if show_worktree:
+            print(f"\n# {worktree}")
+        for s in sorted(by_proj[worktree], key=lambda s: s.updated, reverse=True):
+            files = f"  ({s.files}f +{s.additions}/-{s.deletions})" if s.files else ""
+            title = s.title or s.slug or "(untitled)"
+            print(f"  {s.updated_iso}  {s.id}{files}")
+            print(f"               {title}")
+
+
+def cmd_recent(args: argparse.Namespace) -> int:
+    root = storage_root()
+    projects = load_projects(root)
+    sessions = list(walk_sessions(root, projects))
+    if args.cwd:
+        sessions = filter_by_cwd(sessions, args.cwd)
+    if args.days:
+        sessions = filter_since(sessions, args.days)
+    sessions.sort(key=lambda s: s.updated, reverse=True)
+    sessions = sessions[: args.limit]
+    if args.json:
+        print(json.dumps([asdict(s) for s in sessions], indent=2))
+        return 0
+    _print_human(sessions, show_worktree=not args.cwd)
+    return 0
+
+
+def _haystack(s: Session, root: Path, scan_text: bool) -> str:
+    parts = [s.title, s.slug]
+    if scan_text:
+        parts.append(session_text_blob(root, s.id))
+    else:
+        for msg in load_messages(root, s.id):
+            parts.append(msg.title)
+            parts.extend(msg.files)
+    return "\n".join(p for p in parts if p)
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    root = storage_root()
+    projects = load_projects(root)
+    sessions = list(walk_sessions(root, projects))
+    if args.cwd:
+        sessions = filter_by_cwd(sessions, args.cwd)
+    if args.days:
+        sessions = filter_since(sessions, args.days)
+
+    pattern = re.compile(args.query, re.IGNORECASE)
+    hits: list[tuple[Session, int, list[str]]] = []
+    for s in sessions:
+        hay = _haystack(s, root, scan_text=args.full)
+        matches = pattern.findall(hay)
+        if not matches:
+            continue
+        # Pull a couple of context snippets.
+        snippets: list[str] = []
+        for m in pattern.finditer(hay):
+            start = max(0, m.start() - 60)
+            end = min(len(hay), m.end() + 60)
+            snip = hay[start:end].replace("\n", " ")
+            snippets.append("…" + snip + "…")
+            if len(snippets) >= 3:
+                break
+        hits.append((s, len(matches), snippets))
+
+    hits.sort(key=lambda h: (h[1], h[0].updated), reverse=True)
+    hits = hits[: args.limit]
+
+    if args.json:
+        out = [
+            {
+                "session": asdict(s),
+                "matches": n,
+                "snippets": snippets,
+            }
+            for s, n, snippets in hits
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if not hits:
+        print(f"(no matches for {args.query!r})")
+        return 1
+    for s, n, snippets in hits:
+        print(f"{s.updated_iso}  {s.id}  ({n} hits)  {s.worktree}")
+        print(f"               {s.title or s.slug or '(untitled)'}")
+        for snip in snippets:
+            print(f"               · {snip}")
+        print()
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    root = storage_root()
+    projects = load_projects(root)
+    sessions = {s.id: s for s in walk_sessions(root, projects)}
+    s = sessions.get(args.session_id)
+    if not s:
+        print(f"unknown session: {args.session_id}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        msgs = [asdict(m) for m in load_messages(root, s.id)]
+        print(json.dumps({"session": asdict(s), "messages": msgs}, indent=2))
+        return 0
+
+    print(f"# {s.title or s.slug or '(untitled)'}")
+    print(f"  id:       {s.id}")
+    print(f"  worktree: {s.worktree}")
+    print(f"  created:  {s.created_iso}")
+    print(f"  updated:  {s.updated_iso}")
+    print(f"  edits:    {s.files} files, +{s.additions}/-{s.deletions}")
+    print()
+    for m in load_messages(root, s.id):
+        prefix = "U" if m.role == "user" else "A"
+        title = m.title or "(no summary)"
+        line = f"  [{prefix}] {_iso(m.created)} {title}"
+        print(line)
+        for f in m.files:
+            print(f"        ~ {f}")
+        if args.parts:
+            for typ, txt in iter_part_texts(root, m.message_id):
+                head = txt[:200].replace("\n", " ")
+                print(f"        {typ}: {head}")
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    root = storage_root()
+    projects = load_projects(root)
+    sessions = list(walk_sessions(root, projects))
+    by_proj: dict[str, list[Session]] = {}
+    for s in sessions:
+        proj = projects.get(s.project_id)
+        label = proj.worktree if proj and proj.worktree else (s.worktree or s.project_id or "?")
+        by_proj.setdefault(label, []).append(s)
+    if args.json:
+        out = {
+            "storage": str(root),
+            "projects": len(projects),
+            "sessions": len(sessions),
+            "by_worktree": {k: len(v) for k, v in by_proj.items()},
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"storage:  {root}")
+    print(f"projects: {len(projects)}")
+    print(f"sessions: {len(sessions)}")
+    print()
+    for worktree, slist in sorted(by_proj.items(), key=lambda kv: len(kv[1]), reverse=True):
+        most_recent = max(s.updated for s in slist)
+        print(f"  {len(slist):4d}  {_iso(most_recent)}  {worktree}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="oc-context",
+        description="Surface prior opencode sessions as context for AI agents.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def with_common(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        sp.add_argument("--json", action="store_true", help="Emit JSON instead of human text.")
+        return sp
+
+    pr = with_common(sub.add_parser("recent", help="List recent sessions."))
+    pr.add_argument("--limit", "-n", type=int, default=20)
+    pr.add_argument("--days", type=int, default=0, help="Only sessions updated within N days.")
+    pr.add_argument("--cwd", nargs="?", const=os.getcwd(), default=None,
+                    help="Restrict to sessions in this worktree (default: $PWD if flag given without value).")
+    pr.set_defaults(func=cmd_recent)
+
+    ps = with_common(sub.add_parser("search",
+        help="Search session titles, message summaries, and (optionally) part text."))
+    ps.add_argument("query", help="Regex (case-insensitive).")
+    ps.add_argument("--limit", "-n", type=int, default=10)
+    ps.add_argument("--days", type=int, default=0)
+    ps.add_argument("--cwd", nargs="?", const=os.getcwd(), default=None)
+    ps.add_argument("--full", action="store_true", help="Scan full part text (slower, broader).")
+    ps.set_defaults(func=cmd_search)
+
+    pw = with_common(sub.add_parser("show", help="Show a single session."))
+    pw.add_argument("session_id")
+    pw.add_argument("--parts", action="store_true", help="Include part text snippets.")
+    pw.set_defaults(func=cmd_show)
+
+    pst = with_common(sub.add_parser("stats", help="Storage summary."))
+    pst.set_defaults(func=cmd_stats)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

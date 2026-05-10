@@ -10,6 +10,7 @@ optionally with a `references/` directory.
 |---|---|
 | [`lua-vibe`](./lua-vibe) | Lua best practices and ecosystem (LuaRocks, busted, lua-language-server, stylua, luacheck/selene, LuaCATS). |
 | [`nix-vibe`](./nix-vibe) | Nix flakes and NixOS / nix-darwin / home-manager patterns. |
+| [`oc-context`](./oc-context) | Reuse prior opencode sessions as context. Ships a Python CLI (`oc-context`) that reads `~/.local/share/opencode/storage/` so agents can recall past conversations without manual notes. |
 
 ## Install
 

@@ -1,0 +1,30 @@
+use_cases:
+  - "User references a past conversation by topic ('remember our X issue?')"
+  - "Starting work in a familiar repo and prior session context would help"
+  - "Find which session discussed a specific bug, file, or design decision"
+  - "Summarize what has been done in the current worktree"
+  - "Cross-repo lookup for a topic discussed somewhere across all projects"
+  - "Avoid asking the user to re-explain something covered in a prior session"
+  - "Hand off context between opencode sessions without manual markdown notes"
+  - "Audit recent agent work in a repo by listing sessions with file diffs"
+
+triggers:
+  - "remember"
+  - "last time"
+  - "previously"
+  - "we discussed"
+  - "we fixed"
+  - "we set up"
+  - "continue"
+  - "where did we"
+  - "what have we done"
+  - opencode
+  - "session history"
+
+commands:
+  - "oc-context stats"
+  - "oc-context recent"
+  - "oc-context recent --cwd"
+  - "oc-context search <regex>"
+  - "oc-context search <regex> --full"
+  - "oc-context show <session_id>"
