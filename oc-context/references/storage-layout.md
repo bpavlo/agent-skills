@@ -1,120 +1,194 @@
-# opencode storage layout
+# opencode storage layout (SQLite era)
 
-Reference for what lives under `~/.local/share/opencode/storage/`. Captured
-from a real install on 2026-05-10 against opencode 1.1.65.
+Reference for what lives under `~/.local/share/opencode/`. opencode migrated
+from JSON-on-disk to SQLite; this document covers the SQLite layout and
+notes the legacy directories that still exist.
+
+## Filesystem
 
 ```
 ~/.local/share/opencode/
-├── auth.json                          # provider auth (do not read)
-├── mcp-auth.json                      # MCP server auth (do not read)
-├── opencode.db / opencode-stable.db   # LSP/symbol cache — NOT sessions
-├── log/                               # opencode runtime logs
-├── snapshot/                          # workspace snapshots
-├── tool-output/                       # large tool outputs spilled out of parts
-└── storage/
+├── auth.json                      # provider auth (do not read)
+├── mcp-auth.json
+├── opencode-stable.db             # ACTIVE store — sessions, messages, parts
+├── opencode-stable.db-wal         # WAL log (live writer)
+├── opencode-stable.db-shm
+├── opencode.db                    # older store; may be stale after migration
+├── log/
+├── snapshot/                      # git-style snapshots per project (active)
+├── tool-output/                   # large tool outputs (active)
+└── storage/                       # legacy JSON, mostly frozen post-migration
     ├── project/<projectID>.json
     ├── session/<projectID>/ses_*.json
     ├── message/ses_*/msg_*.json
     ├── part/msg_*/prt_*.json
-    ├── session_diff/...               # per-session aggregated diffs
-    ├── todo/...                       # per-session todo lists
-    └── migration                      # opencode internal
+    └── session_diff/...           # still written for some sessions
 ```
 
-## project/<projectID>.json
+The legacy `storage/` tree no longer reflects current activity. Read the DB.
+
+## Auto-detection
+
+Multiple `opencode*.db` files can co-exist (e.g. `opencode.db` from an older
+channel and `opencode-stable.db` from the current channel). `oc-context`
+picks the one with the most recent mtime; override with `--db`.
+
+## Read-only access
+
+opencode keeps a long-lived writer on the DB in WAL mode. Readers must use
+`file:<path>?mode=ro` URI — **do not** add `nolock=1`, it deadlocks against
+WAL. Multiple concurrent readers are fine.
+
+```python
+import sqlite3
+conn = sqlite3.connect("file:/.../opencode-stable.db?mode=ro", uri=True)
+```
+
+## Schema (key tables)
+
+### `project`
+
+```sql
+CREATE TABLE project (
+    id TEXT PRIMARY KEY,
+    worktree TEXT NOT NULL,
+    vcs TEXT,
+    name TEXT,
+    icon_url TEXT,
+    icon_color TEXT,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    time_initialized INTEGER,
+    sandboxes TEXT NOT NULL,
+    commands TEXT,
+    icon_url_override TEXT
+);
+```
+
+`id` is a 40-char hex hash, stable across renames. There is a synthetic
+`global` project with `worktree = '/'` for sessions outside any repo.
+
+### `session`
+
+```sql
+CREATE TABLE session (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    parent_id TEXT,
+    slug TEXT NOT NULL,
+    directory TEXT NOT NULL,   -- the actual worktree at session creation
+    title TEXT NOT NULL,
+    version TEXT NOT NULL,
+    share_url TEXT,
+    summary_additions INTEGER,
+    summary_deletions INTEGER,
+    summary_files INTEGER,
+    summary_diffs TEXT,
+    revert TEXT,
+    permission TEXT,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    time_compacting INTEGER,
+    time_archived INTEGER,
+    workspace_id TEXT,
+    path TEXT,
+    FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+);
+CREATE INDEX session_project_idx ON session(project_id);
+CREATE INDEX session_parent_idx  ON session(parent_id);
+```
+
+Indexed by project and parent. Time fields are Unix milliseconds.
+`time_archived IS NOT NULL` marks a session as hidden from the default UI;
+exclude it unless `--archived` is requested.
+
+### `message`
+
+```sql
+CREATE TABLE message (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    data TEXT NOT NULL,        -- JSON
+    FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+);
+CREATE INDEX message_session_time_created_id_idx
+    ON message(session_id, time_created, id);
+```
+
+`data` JSON shape:
 
 ```json
 {
-  "id": "8c640995d6a99402bb7635ad1f4d45b394fef0bb",
-  "worktree": "/home/pavlo/work/barley",
-  "vcs": "git",
-  "sandboxes": [],
-  "time": { "created": 1770941036386, "updated": 1771554221911 }
-}
-```
-
-`projectID` is a SHA-1-like hash; it is *not* derived from the worktree path
-(renaming a repo on disk keeps the same project ID). `worktree` is the *latest*
-path opencode saw for that project.
-
-## session/<projectID>/ses_*.json
-
-```json
-{
-  "id": "ses_38723ba86ffeeg5oZuWxdQpqD7",
-  "slug": "clever-star",
-  "version": "1.1.65",
-  "projectID": "8c640995d6a99402bb7635ad1f4d45b394fef0bb",
-  "directory": "/home/pavlo/work/barley",
-  "title": "Lambda registry KeyError fix in detect_affected_lambdas.py",
-  "time": { "created": 1771554227577, "updated": 1771554244237 },
-  "summary": { "additions": 2, "deletions": 0, "files": 1 }
-}
-```
-
-`directory` is the session's worktree at the time it was created — it may
-differ from `project.worktree` if the repo was moved between sessions.
-
-`summary` may be `false` for some old sessions; callers must defensively
-type-check before treating it as an object.
-
-## message/ses_*/msg_*.json
-
-User message:
-
-```json
-{
-  "id": "msg_c78dc457b001IuhkihCau4u6qk",
-  "sessionID": "ses_...",
-  "role": "user",
-  "time": { "created": 1771554227585 },
-  "summary": {
-    "title": "Fix KeyError in detect_affected_lambdas.py",
-    "diffs": [
-      { "file": "...py", "before": "..." }
-    ]
-  }
-}
-```
-
-Assistant message:
-
-```json
-{
-  "id": "msg_...",
-  "sessionID": "ses_...",
-  "role": "assistant",
-  "time": { "created": ..., "completed": ... },
-  "parentID": "msg_...",
-  "modelID": "claude-sonnet-4-6",
-  "providerID": "anthropic",
+  "role": "user" | "assistant",
+  "modelID": "<provider model id>",
+  "providerID": "<provider>",
   "mode": "build",
   "agent": "build",
-  "path": { "cwd": "...", "root": "..." },
-  "cost": 0,
-  "tokens": { "total": ..., "input": ..., "output": ..., "cache": {...} },
-  "finish": "tool-calls"
+  "summary": {
+    "title": "<short summary of the message>",
+    "diffs": [{ "file": "<path>", "before": "<snippet>" }]
+  },
+  "tokens": { "total": 0, "input": 0, "output": 0 }
 }
 ```
 
-Assistant messages usually lack `summary`; the content lives in their `part/`
-children.
+Use `json_extract(data, '$.role')` for the common query.
 
-## part/msg_*/prt_*.json
+### `part`
 
-Types observed in the wild (sampled count from a real corpus of ~4700 parts):
+```sql
+CREATE TABLE part (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    data TEXT NOT NULL,        -- JSON
+    FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE
+);
+CREATE INDEX part_session_idx ON part(session_id);
+CREATE INDEX part_message_id_id_idx ON part(message_id, id);
+```
 
-| type         | shape                                                    |
-|--------------|----------------------------------------------------------|
-| `text`       | `{ text: "..." }` — the actual user/assistant prose      |
-| `reasoning`  | `{ text: "..." }` — model reasoning trace                |
-| `tool`       | `{ tool, callID, state: { input, output, status } }`     |
-| `patch`      | `{ hash, files: [...] }` — refers to session_diff entry  |
-| `file`       | `{ filename, url, source: { path, ... } }` — attachment  |
-| `step-start` | tool/turn boundary marker                                |
-| `step-finish`| tool/turn boundary marker                                |
-| `subtask`    | nested agent invocation                                  |
+`data.type` values seen in practice:
 
-For digest / search, the useful types are `text`, `reasoning`, and `patch`.
-`tool` outputs are large and noisy — include only when you need to scan
-specific tool calls.
+| type         | notes                                              |
+|--------------|----------------------------------------------------|
+| `tool`       | tool call + state.output (large, noisy)            |
+| `step-start` | turn marker                                        |
+| `step-finish`| turn marker                                        |
+| `reasoning`  | model reasoning trace (searchable)                 |
+| `text`       | user/assistant prose (searchable, primary signal)  |
+| `patch`      | `data.files` lists patched files                   |
+| `file`       | attached file reference                            |
+| `compaction` | session summarization marker                       |
+
+For recall, `text` and `reasoning` are the useful kinds. `oc-context`
+indexes only those into FTS5.
+
+## FTS5 sidecar
+
+`oc-context` keeps its own DB at `~/.local/share/oc-context/index.db`:
+
+```sql
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE VIRTUAL TABLE part_fts USING fts5(
+    text,
+    session_id UNINDEXED,
+    message_id UNINDEXED,
+    part_id    UNINDEXED,
+    role       UNINDEXED,
+    kind       UNINDEXED,
+    tokenize='unicode61 remove_diacritics 2'
+);
+```
+
+`meta` keys:
+- `source_db` — absolute path of the opencode DB we indexed.
+- `last_part_id` — highest `part.id` seen; incremental refresh uses
+  `WHERE part.id > last_part_id`.
+- `last_refresh_ms` — source DB mtime at last refresh; used to skip work.
+
+If `source_db` changes (channel switch), the sidecar is dropped and rebuilt.

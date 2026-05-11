@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """oc-context — surface prior opencode sessions as context for AI agents.
 
-Read-only digest over `~/.local/share/opencode/storage/`. No external deps.
-Designed so a future `semantic` subcommand can reuse `walk_sessions()` and
-`load_session_text()` against a vector index.
+Reads opencode's SQLite store at ~/.local/share/opencode/opencode-stable.db
+(or whichever opencode*.db is most recently modified). Builds an FTS5 index
+over text/reasoning parts in a sidecar DB to support fast, ranked recall.
 
-Layout reference:
-    project/<projectID>.json
-    session/<projectID>/<ses_*>.json
-    message/<ses_*>/<msg_*>.json
-    part/<msg_*>/<prt_*>.json
+Subcommands: recent, search, show, stats, reindex.
+
+Design notes:
+    - Read-only against opencode's DB.
+    - Sidecar FTS index at $XDG_DATA_HOME/oc-context/index.db.
+    - Incremental refresh: only parts with id > last seen id are added.
 """
 
 from __future__ import annotations
@@ -17,32 +18,69 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
+import sqlite3
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 
-def storage_root() -> Path:
-    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(xdg) / "opencode" / "storage"
+# ---------- locations ----------
 
 
-@dataclass
-class Project:
-    id: str
-    worktree: str
-    created: int = 0
-    updated: int = 0
+def _xdg_data() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+
+
+def find_opencode_db(explicit: str | None = None) -> Path:
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"db not found: {p}")
+        return p
+    base = _xdg_data() / "opencode"
+    candidates = sorted(
+        (p for p in base.glob("opencode*.db") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"no opencode*.db under {base}")
+    return candidates[0]
+
+
+def index_db_path() -> Path:
+    d = _xdg_data() / "oc-context"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "index.db"
+
+
+# ---------- helpers ----------
+
+
+def _iso(ms: int | None) -> str:
+    if not ms:
+        return ""
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+
+def _open_ro(path: Path) -> sqlite3.Connection:
+    # WAL mode allows concurrent readers; mode=ro is the safe choice while
+    # opencode owns the writer. nolock=1 would deadlock against WAL.
+    uri = f"file:{path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 @dataclass
 class Session:
     id: str
     project_id: str
-    worktree: str
+    directory: str
     title: str
     slug: str
     created: int
@@ -50,330 +88,502 @@ class Session:
     additions: int = 0
     deletions: int = 0
     files: int = 0
-
-    @property
-    def created_iso(self) -> str:
-        return _iso(self.created)
+    archived: int = 0
 
     @property
     def updated_iso(self) -> str:
         return _iso(self.updated)
 
 
-@dataclass
-class MessageSummary:
-    session_id: str
-    message_id: str
-    role: str
-    title: str = ""
-    files: list[str] = field(default_factory=list)
-    created: int = 0
+def _row_to_session(row: sqlite3.Row) -> Session:
+    return Session(
+        id=row["id"],
+        project_id=row["project_id"],
+        directory=row["directory"] or "",
+        title=row["title"] or "",
+        slug=row["slug"] or "",
+        created=row["time_created"] or 0,
+        updated=row["time_updated"] or 0,
+        additions=row["summary_additions"] or 0,
+        deletions=row["summary_deletions"] or 0,
+        files=row["summary_files"] or 0,
+        archived=row["time_archived"] or 0,
+    )
 
 
-def _iso(ms: int) -> str:
-    if not ms:
-        return ""
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+SESSION_COLS = (
+    "id, project_id, directory, title, slug, "
+    "time_created, time_updated, "
+    "summary_additions, summary_deletions, summary_files, time_archived"
+)
 
 
-def _load_json(path: Path) -> dict | None:
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
+def fetch_sessions(
+    conn: sqlite3.Connection,
+    cwd: str | None = None,
+    days: int = 0,
+    limit: int | None = None,
+    include_archived: bool = False,
+) -> list[Session]:
+    where = []
+    params: list = []
+    if cwd:
+        where.append("directory = ?")
+        params.append(str(Path(cwd).resolve()))
+    if days > 0:
+        cutoff_ms = int((datetime.now().timestamp() - days * 86400) * 1000)
+        where.append("time_updated >= ?")
+        params.append(cutoff_ms)
+    if not include_archived:
+        where.append("(time_archived IS NULL OR time_archived = 0)")
+    sql = f"SELECT {SESSION_COLS} FROM session"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY time_updated DESC"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    cur = conn.execute(sql, params)
+    return [_row_to_session(r) for r in cur.fetchall()]
 
 
-def load_projects(root: Path) -> dict[str, Project]:
-    out: dict[str, Project] = {}
-    proj_dir = root / "project"
-    if not proj_dir.is_dir():
-        return out
-    for f in proj_dir.glob("*.json"):
-        d = _load_json(f)
-        if not d:
-            continue
-        pid = d.get("id") or f.stem
-        out[pid] = Project(
-            id=pid,
-            worktree=d.get("worktree", ""),
-            created=(d.get("time") or {}).get("created", 0),
-            updated=(d.get("time") or {}).get("updated", 0),
-        )
-    return out
+def fetch_session(conn: sqlite3.Connection, session_id: str) -> Session | None:
+    cur = conn.execute(f"SELECT {SESSION_COLS} FROM session WHERE id = ?", (session_id,))
+    row = cur.fetchone()
+    return _row_to_session(row) if row else None
 
 
-def walk_sessions(root: Path, projects: dict[str, Project]) -> Iterator[Session]:
-    sess_root = root / "session"
-    if not sess_root.is_dir():
-        return
-    for proj_dir in sess_root.iterdir():
-        if not proj_dir.is_dir():
-            continue
-        proj = projects.get(proj_dir.name)
-        worktree = proj.worktree if proj else proj_dir.name
-        for sf in proj_dir.glob("ses_*.json"):
-            d = _load_json(sf)
-            if not d:
-                continue
-            t = d.get("time") or {}
-            s = d.get("summary")
-            if not isinstance(s, dict):
-                s = {}
-            yield Session(
-                id=d.get("id") or sf.stem,
-                project_id=d.get("projectID", proj_dir.name),
-                worktree=d.get("directory") or worktree,
-                title=d.get("title", "") or "",
-                slug=d.get("slug", "") or "",
-                created=t.get("created", 0),
-                updated=t.get("updated", 0),
-                additions=s.get("additions", 0),
-                deletions=s.get("deletions", 0),
-                files=s.get("files", 0),
-            )
-
-
-def load_messages(root: Path, session_id: str) -> list[MessageSummary]:
-    mdir = root / "message" / session_id
-    if not mdir.is_dir():
-        return []
-    out: list[MessageSummary] = []
-    for mf in mdir.glob("msg_*.json"):
-        d = _load_json(mf)
-        if not d:
-            continue
-        summary = d.get("summary")
-        if not isinstance(summary, dict):
-            summary = {}
-        files = []
-        for diff in summary.get("diffs") or []:
-            f = diff.get("file")
-            if f:
-                files.append(f)
+def fetch_messages(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    """Return list of {id, role, time, text_preview, files}."""
+    cur = conn.execute(
+        "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+        (session_id,),
+    )
+    out: list[dict] = []
+    for row in cur:
+        try:
+            data = json.loads(row["data"])
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+        files = [d.get("file") for d in (summary.get("diffs") or []) if d.get("file")]
         out.append(
-            MessageSummary(
-                session_id=session_id,
-                message_id=d.get("id") or mf.stem,
-                role=d.get("role", ""),
-                title=summary.get("title", "") or "",
-                files=files,
-                created=(d.get("time") or {}).get("created", 0),
-            )
+            {
+                "id": row["id"],
+                "role": data.get("role", ""),
+                "created": row["time_created"],
+                "title": summary.get("title", "") or "",
+                "files": files,
+                "model": data.get("modelID", ""),
+            }
         )
-    out.sort(key=lambda m: m.created)
     return out
 
 
-def iter_part_texts(root: Path, message_id: str) -> Iterator[tuple[str, str]]:
-    """Yield (type, text) tuples for a message's parts. Includes text, reasoning,
-    and patch file lists; skips heavy tool output by default."""
-    pdir = root / "part" / message_id
-    if not pdir.is_dir():
-        return
-    for pf in sorted(pdir.glob("prt_*.json")):
-        d = _load_json(pf)
-        if not d:
-            continue
-        t = d.get("type", "")
-        if t == "text":
-            yield t, d.get("text", "") or ""
-        elif t == "reasoning":
-            yield t, d.get("text", "") or ""
-        elif t == "patch":
-            files = d.get("files") or []
-            if files:
-                yield t, "patched: " + ", ".join(files)
+def fetch_message_parts(conn: sqlite3.Connection, message_id: str) -> list[dict]:
+    cur = conn.execute(
+        "SELECT id, data FROM part WHERE message_id = ? ORDER BY id", (message_id,)
+    )
+    out: list[dict] = []
+    for row in cur:
+        try:
+            data = json.loads(row["data"])
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        out.append({"id": row["id"], **data})
+    return out
 
 
-def session_text_blob(root: Path, session_id: str, include_reasoning: bool = False) -> str:
-    """Concatenated message + part text for a session. Used by search."""
-    chunks: list[str] = []
-    for msg in load_messages(root, session_id):
-        if msg.title:
-            chunks.append(msg.title)
-        for typ, txt in iter_part_texts(root, msg.message_id):
-            if typ == "reasoning" and not include_reasoning:
+# ---------- FTS index (sidecar) ----------
+
+
+FTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS part_fts USING fts5(
+    text,
+    session_id UNINDEXED,
+    message_id UNINDEXED,
+    part_id UNINDEXED,
+    role UNINDEXED,
+    kind UNINDEXED,
+    tokenize='unicode61 remove_diacritics 2'
+);
+"""
+
+
+def open_index() -> sqlite3.Connection:
+    conn = sqlite3.connect(index_db_path())
+    conn.row_factory = sqlite3.Row
+    conn.executescript(FTS_SCHEMA)
+    return conn
+
+
+def _last_indexed_part_id(idx: sqlite3.Connection) -> str:
+    row = idx.execute("SELECT value FROM meta WHERE key = 'last_part_id'").fetchone()
+    return row[0] if row else ""
+
+
+def _set_last_indexed_part_id(idx: sqlite3.Connection, part_id: str) -> None:
+    idx.execute(
+        "INSERT INTO meta(key, value) VALUES('last_part_id', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (part_id,),
+    )
+
+
+def _last_indexed_db_path(idx: sqlite3.Connection) -> str:
+    row = idx.execute("SELECT value FROM meta WHERE key = 'source_db'").fetchone()
+    return row[0] if row else ""
+
+
+def _set_indexed_db_path(idx: sqlite3.Connection, path: str) -> None:
+    idx.execute(
+        "INSERT INTO meta(key, value) VALUES('source_db', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (path,),
+    )
+
+
+def _extract_text(data: dict) -> tuple[str, str] | None:
+    """Return (text, kind) for indexable parts, else None."""
+    t = data.get("type", "")
+    if t == "text":
+        txt = data.get("text") or ""
+        return (txt, "text") if txt else None
+    if t == "reasoning":
+        txt = data.get("text") or ""
+        return (txt, "reasoning") if txt else None
+    return None
+
+
+def reindex(force: bool = False, verbose: bool = False) -> dict:
+    src = find_opencode_db()
+    idx = open_index()
+    if force or _last_indexed_db_path(idx) != str(src):
+        idx.execute("DELETE FROM part_fts")
+        idx.execute("DELETE FROM meta WHERE key = 'last_part_id'")
+        _set_indexed_db_path(idx, str(src))
+    last = _last_indexed_part_id(idx)
+    added = 0
+    skipped = 0
+
+    with _open_ro(src) as ro, idx:
+        cur = ro.execute(
+            "SELECT p.id, p.session_id, p.message_id, p.data, "
+            "       json_extract(m.data, '$.role') AS role "
+            "FROM part p JOIN message m ON m.id = p.message_id "
+            "WHERE p.id > ? ORDER BY p.id",
+            (last,),
+        )
+        batch: list[tuple] = []
+        latest_id = last
+        for row in cur:
+            latest_id = row["id"]
+            try:
+                data = json.loads(row["data"])
+            except (json.JSONDecodeError, TypeError):
+                skipped += 1
                 continue
-            chunks.append(txt)
-    return "\n".join(chunks)
+            extracted = _extract_text(data)
+            if not extracted:
+                skipped += 1
+                continue
+            text, kind = extracted
+            batch.append(
+                (text, row["session_id"], row["message_id"], row["id"], row["role"] or "", kind)
+            )
+            if len(batch) >= 1000:
+                idx.executemany(
+                    "INSERT INTO part_fts(text, session_id, message_id, part_id, role, kind) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    batch,
+                )
+                added += len(batch)
+                if verbose:
+                    print(f"  indexed {added}…", file=sys.stderr)
+                batch.clear()
+        if batch:
+            idx.executemany(
+                "INSERT INTO part_fts(text, session_id, message_id, part_id, role, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                batch,
+            )
+            added += len(batch)
+        if latest_id:
+            _set_last_indexed_part_id(idx, latest_id)
+
+    return {"added": added, "skipped": skipped, "source_db": str(src)}
 
 
 # ---------- commands ----------
 
 
-def filter_by_cwd(sessions: list[Session], cwd: str) -> list[Session]:
-    cwd = str(Path(cwd).resolve())
-    return [s for s in sessions if s.worktree == cwd]
-
-
-def filter_since(sessions: list[Session], days: int) -> list[Session]:
-    if days <= 0:
-        return sessions
-    cutoff = (datetime.now().timestamp() - days * 86400) * 1000
-    return [s for s in sessions if s.updated >= cutoff]
-
-
-def _print_human(sessions: list[Session], show_worktree: bool) -> None:
+def _print_session_list(sessions: list[Session], *, group_by_dir: bool) -> None:
     if not sessions:
         print("(no sessions)")
         return
-    by_proj: dict[str, list[Session]] = {}
-    for s in sessions:
-        by_proj.setdefault(s.worktree or "?", []).append(s)
-    for worktree in sorted(by_proj, key=lambda k: max(s.updated for s in by_proj[k]), reverse=True):
-        if show_worktree:
-            print(f"\n# {worktree}")
-        for s in sorted(by_proj[worktree], key=lambda s: s.updated, reverse=True):
-            files = f"  ({s.files}f +{s.additions}/-{s.deletions})" if s.files else ""
-            title = s.title or s.slug or "(untitled)"
-            print(f"  {s.updated_iso}  {s.id}{files}")
-            print(f"               {title}")
+    if group_by_dir:
+        groups: dict[str, list[Session]] = {}
+        for s in sessions:
+            groups.setdefault(s.directory or "?", []).append(s)
+        for directory in sorted(
+            groups, key=lambda k: max(s.updated for s in groups[k]), reverse=True
+        ):
+            print(f"\n# {directory}")
+            for s in groups[directory]:
+                _print_session_line(s)
+    else:
+        for s in sessions:
+            _print_session_line(s)
+
+
+def _print_session_line(s: Session) -> None:
+    files = f"  ({s.files}f +{s.additions}/-{s.deletions})" if s.files else ""
+    title = s.title or s.slug or "(untitled)"
+    print(f"  {s.updated_iso}  {s.id}{files}")
+    print(f"               {title}")
 
 
 def cmd_recent(args: argparse.Namespace) -> int:
-    root = storage_root()
-    projects = load_projects(root)
-    sessions = list(walk_sessions(root, projects))
-    if args.cwd:
-        sessions = filter_by_cwd(sessions, args.cwd)
-    if args.days:
-        sessions = filter_since(sessions, args.days)
-    sessions.sort(key=lambda s: s.updated, reverse=True)
-    sessions = sessions[: args.limit]
+    src = find_opencode_db(args.db)
+    with _open_ro(src) as conn:
+        sessions = fetch_sessions(
+            conn,
+            cwd=args.cwd,
+            days=args.days,
+            limit=args.limit,
+            include_archived=args.archived,
+        )
     if args.json:
         print(json.dumps([asdict(s) for s in sessions], indent=2))
         return 0
-    _print_human(sessions, show_worktree=not args.cwd)
+    _print_session_list(sessions, group_by_dir=not args.cwd)
     return 0
 
 
-def _haystack(s: Session, root: Path, scan_text: bool) -> str:
-    parts = [s.title, s.slug]
-    if scan_text:
-        parts.append(session_text_blob(root, s.id))
-    else:
-        for msg in load_messages(root, s.id):
-            parts.append(msg.title)
-            parts.extend(msg.files)
-    return "\n".join(p for p in parts if p)
-
-
 def cmd_search(args: argparse.Namespace) -> int:
-    root = storage_root()
-    projects = load_projects(root)
-    sessions = list(walk_sessions(root, projects))
-    if args.cwd:
-        sessions = filter_by_cwd(sessions, args.cwd)
-    if args.days:
-        sessions = filter_since(sessions, args.days)
+    src = find_opencode_db(args.db)
 
-    pattern = re.compile(args.query, re.IGNORECASE)
-    hits: list[tuple[Session, int, list[str]]] = []
-    for s in sessions:
-        hay = _haystack(s, root, scan_text=args.full)
-        matches = pattern.findall(hay)
-        if not matches:
-            continue
-        # Pull a couple of context snippets.
-        snippets: list[str] = []
-        for m in pattern.finditer(hay):
-            start = max(0, m.start() - 60)
-            end = min(len(hay), m.end() + 60)
-            snip = hay[start:end].replace("\n", " ")
-            snippets.append("…" + snip + "…")
-            if len(snippets) >= 3:
-                break
-        hits.append((s, len(matches), snippets))
+    # Auto-reindex if the source DB is newer than our index or unindexed.
+    idx = open_index()
+    needs_reindex = False
+    if _last_indexed_db_path(idx) != str(src):
+        needs_reindex = True
+    else:
+        mtime_ms = int(src.stat().st_mtime * 1000)
+        last_row = idx.execute(
+            "SELECT value FROM meta WHERE key = 'last_refresh_ms'"
+        ).fetchone()
+        last_refresh = int(last_row[0]) if last_row and last_row[0] else 0
+        if mtime_ms > last_refresh:
+            needs_reindex = True
+    idx.close()
 
-    hits.sort(key=lambda h: (h[1], h[0].updated), reverse=True)
-    hits = hits[: args.limit]
+    if needs_reindex and not args.no_refresh:
+        stats = reindex(verbose=False)
+        with open_index() as idx:
+            idx.execute(
+                "INSERT INTO meta(key, value) VALUES('last_refresh_ms', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(int(src.stat().st_mtime * 1000)),),
+            )
+
+    # Run the search.
+    with open_index() as idx, _open_ro(src) as conn:
+        # FTS5 MATCH; if user provided a plain phrase, quote it.
+        q = args.query
+        if not any(c in q for c in '"*:^'):
+            # Build OR query across whitespace-separated tokens to be forgiving,
+            # OR a phrase match for the literal.
+            tokens = [t for t in q.split() if t]
+            phrase = '"' + q.replace('"', '') + '"'
+            if len(tokens) > 1:
+                fts_q = f'({phrase}) OR ({" OR ".join(tokens)})'
+            else:
+                fts_q = phrase
+        else:
+            fts_q = q
+
+        sql = (
+            "SELECT session_id, message_id, part_id, role, kind, "
+            "       snippet(part_fts, 0, '<<', '>>', '…', 12) AS snip, "
+            "       bm25(part_fts) AS score "
+            "FROM part_fts WHERE part_fts MATCH ? "
+            "ORDER BY score LIMIT ?"
+        )
+        try:
+            rows = idx.execute(sql, (fts_q, args.limit * 5)).fetchall()
+        except sqlite3.OperationalError as e:
+            print(f"FTS query error: {e}\nTry quoting your query.", file=sys.stderr)
+            return 2
+
+        # Group hits by session, apply filters, attach session metadata.
+        per_session: dict[str, list[sqlite3.Row]] = {}
+        for r in rows:
+            per_session.setdefault(r["session_id"], []).append(r)
+
+        results: list[dict] = []
+        for sid, hits in per_session.items():
+            sess = fetch_session(conn, sid)
+            if not sess:
+                continue
+            if args.cwd and sess.directory != str(Path(args.cwd).resolve()):
+                continue
+            if args.days > 0:
+                cutoff = int((datetime.now().timestamp() - args.days * 86400) * 1000)
+                if sess.updated < cutoff:
+                    continue
+            results.append(
+                {
+                    "session": sess,
+                    "hits": hits[: args.snippets],
+                    "n_hits": len(hits),
+                }
+            )
+
+        results.sort(key=lambda x: (x["session"].updated, x["n_hits"]), reverse=True)
+        results = results[: args.limit]
 
     if args.json:
         out = [
             {
-                "session": asdict(s),
-                "matches": n,
-                "snippets": snippets,
+                "session": asdict(r["session"]),
+                "matches": r["n_hits"],
+                "snippets": [
+                    {"role": h["role"], "kind": h["kind"], "text": h["snip"]}
+                    for h in r["hits"]
+                ],
             }
-            for s, n, snippets in hits
+            for r in results
         ]
         print(json.dumps(out, indent=2))
         return 0
 
-    if not hits:
+    if not results:
         print(f"(no matches for {args.query!r})")
         return 1
-    for s, n, snippets in hits:
-        print(f"{s.updated_iso}  {s.id}  ({n} hits)  {s.worktree}")
+    for r in results:
+        s: Session = r["session"]
+        print(f"{s.updated_iso}  {s.id}  ({r['n_hits']} hits)  {s.directory}")
         print(f"               {s.title or s.slug or '(untitled)'}")
-        for snip in snippets:
-            print(f"               · {snip}")
+        for h in r["hits"]:
+            snip = h["snip"].replace("\n", " ")
+            print(f"               · [{h['role']}/{h['kind']}] {snip}")
         print()
     return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    root = storage_root()
-    projects = load_projects(root)
-    sessions = {s.id: s for s in walk_sessions(root, projects)}
-    s = sessions.get(args.session_id)
-    if not s:
-        print(f"unknown session: {args.session_id}", file=sys.stderr)
-        return 1
+    src = find_opencode_db(args.db)
+    with _open_ro(src) as conn:
+        s = fetch_session(conn, args.session_id)
+        if not s:
+            print(f"unknown session: {args.session_id}", file=sys.stderr)
+            return 1
+        msgs = fetch_messages(conn, s.id)
+        if args.parts:
+            for m in msgs:
+                m["parts"] = fetch_message_parts(conn, m["id"])
 
     if args.json:
-        msgs = [asdict(m) for m in load_messages(root, s.id)]
-        print(json.dumps({"session": asdict(s), "messages": msgs}, indent=2))
+        print(json.dumps({"session": asdict(s), "messages": msgs}, indent=2, default=str))
         return 0
 
     print(f"# {s.title or s.slug or '(untitled)'}")
-    print(f"  id:       {s.id}")
-    print(f"  worktree: {s.worktree}")
-    print(f"  created:  {s.created_iso}")
-    print(f"  updated:  {s.updated_iso}")
-    print(f"  edits:    {s.files} files, +{s.additions}/-{s.deletions}")
+    print(f"  id:        {s.id}")
+    print(f"  directory: {s.directory}")
+    print(f"  created:   {_iso(s.created)}")
+    print(f"  updated:   {_iso(s.updated)}")
+    print(f"  edits:     {s.files} files, +{s.additions}/-{s.deletions}")
     print()
-    for m in load_messages(root, s.id):
-        prefix = "U" if m.role == "user" else "A"
-        title = m.title or "(no summary)"
-        line = f"  [{prefix}] {_iso(m.created)} {title}"
-        print(line)
-        for f in m.files:
+    for m in msgs:
+        prefix = "U" if m["role"] == "user" else "A"
+        title = m["title"] or "(no summary)"
+        print(f"  [{prefix}] {_iso(m['created'])} {title}")
+        for f in m["files"]:
             print(f"        ~ {f}")
         if args.parts:
-            for typ, txt in iter_part_texts(root, m.message_id):
-                head = txt[:200].replace("\n", " ")
-                print(f"        {typ}: {head}")
+            for p in m.get("parts", []):
+                t = p.get("type", "")
+                if t in ("text", "reasoning"):
+                    head = (p.get("text") or "")[:200].replace("\n", " ")
+                    print(f"        {t}: {head}")
+                elif t == "patch":
+                    print(f"        patch: {', '.join(p.get('files') or [])}")
     return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    root = storage_root()
-    projects = load_projects(root)
-    sessions = list(walk_sessions(root, projects))
-    by_proj: dict[str, list[Session]] = {}
-    for s in sessions:
-        proj = projects.get(s.project_id)
-        label = proj.worktree if proj and proj.worktree else (s.worktree or s.project_id or "?")
-        by_proj.setdefault(label, []).append(s)
+    src = find_opencode_db(args.db)
+    with _open_ro(src) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        msg_total = conn.execute("SELECT COUNT(*) FROM message").fetchone()[0]
+        part_total = conn.execute("SELECT COUNT(*) FROM part").fetchone()[0]
+        rows = conn.execute(
+            "SELECT directory, COUNT(*) AS n, MAX(time_updated) AS last "
+            "FROM session WHERE time_archived IS NULL OR time_archived = 0 "
+            "GROUP BY directory ORDER BY n DESC"
+        ).fetchall()
+
+    idx_rows = 0
+    try:
+        with open_index() as idx:
+            r = idx.execute("SELECT COUNT(*) FROM part_fts").fetchone()
+            idx_rows = r[0] if r else 0
+    except sqlite3.Error:
+        pass
+
     if args.json:
-        out = {
-            "storage": str(root),
-            "projects": len(projects),
-            "sessions": len(sessions),
-            "by_worktree": {k: len(v) for k, v in by_proj.items()},
-        }
-        print(json.dumps(out, indent=2))
+        print(
+            json.dumps(
+                {
+                    "source_db": str(src),
+                    "sessions": total,
+                    "messages": msg_total,
+                    "parts": part_total,
+                    "indexed_parts": idx_rows,
+                    "by_directory": [
+                        {"directory": r["directory"], "sessions": r["n"], "last_updated": r["last"]}
+                        for r in rows
+                    ],
+                },
+                indent=2,
+            )
+        )
         return 0
-    print(f"storage:  {root}")
-    print(f"projects: {len(projects)}")
-    print(f"sessions: {len(sessions)}")
+
+    print(f"source:   {src}")
+    print(f"sessions: {total}")
+    print(f"messages: {msg_total}")
+    print(f"parts:    {part_total}")
+    print(f"indexed:  {idx_rows} parts in {index_db_path()}")
     print()
-    for worktree, slist in sorted(by_proj.items(), key=lambda kv: len(kv[1]), reverse=True):
-        most_recent = max(s.updated for s in slist)
-        print(f"  {len(slist):4d}  {_iso(most_recent)}  {worktree}")
+    for r in rows[:30]:
+        print(f"  {r['n']:5d}  {_iso(r['last'])}  {r['directory'] or '(?)'}")
+    if len(rows) > 30:
+        print(f"  … {len(rows) - 30} more directories")
     return 0
+
+
+def cmd_reindex(args: argparse.Namespace) -> int:
+    stats = reindex(force=args.full, verbose=True)
+    with open_index() as idx:
+        idx.execute(
+            "INSERT INTO meta(key, value) VALUES('last_refresh_ms', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(int(Path(stats["source_db"]).stat().st_mtime * 1000)),),
+        )
+    if args.json:
+        print(json.dumps(stats, indent=2))
+    else:
+        print(f"added {stats['added']} parts (skipped {stats['skipped']}) from {stats['source_db']}")
+        print(f"index: {index_db_path()}")
+    return 0
+
+
+# ---------- main ----------
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -383,36 +593,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def with_common(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        sp.add_argument("--json", action="store_true", help="Emit JSON instead of human text.")
+    def common(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        sp.add_argument("--json", action="store_true", help="Emit JSON.")
+        sp.add_argument("--db", default=None,
+                        help="Path to opencode DB (default: newest opencode*.db under XDG_DATA_HOME).")
         return sp
 
-    pr = with_common(sub.add_parser("recent", help="List recent sessions."))
+    pr = common(sub.add_parser("recent", help="List recent sessions."))
     pr.add_argument("--limit", "-n", type=int, default=20)
-    pr.add_argument("--days", type=int, default=0, help="Only sessions updated within N days.")
+    pr.add_argument("--days", type=int, default=0)
     pr.add_argument("--cwd", nargs="?", const=os.getcwd(), default=None,
-                    help="Restrict to sessions in this worktree (default: $PWD if flag given without value).")
+                    help="Restrict to sessions whose directory == this path (default: $PWD when flag given without value).")
+    pr.add_argument("--archived", action="store_true", help="Include archived sessions.")
     pr.set_defaults(func=cmd_recent)
 
-    ps = with_common(sub.add_parser("search",
-        help="Search session titles, message summaries, and (optionally) part text."))
-    ps.add_argument("query", help="Regex (case-insensitive).")
+    ps = common(sub.add_parser("search", help="Full-text search across part text/reasoning."))
+    ps.add_argument("query", help="FTS5 query (or plain phrase).")
     ps.add_argument("--limit", "-n", type=int, default=10)
+    ps.add_argument("--snippets", type=int, default=3, help="Snippets per session.")
     ps.add_argument("--days", type=int, default=0)
     ps.add_argument("--cwd", nargs="?", const=os.getcwd(), default=None)
-    ps.add_argument("--full", action="store_true", help="Scan full part text (slower, broader).")
+    ps.add_argument("--no-refresh", action="store_true", help="Skip auto-reindex.")
     ps.set_defaults(func=cmd_search)
 
-    pw = with_common(sub.add_parser("show", help="Show a single session."))
+    pw = common(sub.add_parser("show", help="Show one session."))
     pw.add_argument("session_id")
     pw.add_argument("--parts", action="store_true", help="Include part text snippets.")
     pw.set_defaults(func=cmd_show)
 
-    pst = with_common(sub.add_parser("stats", help="Storage summary."))
+    pst = common(sub.add_parser("stats", help="Storage summary."))
     pst.set_defaults(func=cmd_stats)
 
+    pri = common(sub.add_parser("reindex", help="Rebuild or refresh the FTS index."))
+    pri.add_argument("--full", action="store_true", help="Discard and rebuild.")
+    pri.set_defaults(func=cmd_reindex)
+
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
