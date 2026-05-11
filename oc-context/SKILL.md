@@ -1,139 +1,148 @@
 ---
 name: oc-context
-version: 0.1.0
-description: Surface prior opencode sessions as context. Use when the user references a past conversation ("remember the X issue", "we discussed Y last week", "continue what we were doing in Z") or when starting work in a familiar repo and prior context would help. Reads `~/.local/share/opencode/storage/` directly via the `oc-context` script — no markdown notes to maintain.
+version: 0.2.0
+description: Recall prior opencode sessions. ALWAYS load when the user says "remember", "last time", "previously", "we discussed", "we fixed", "we set up", "continue", "where did we", "what have we done", or otherwise references a past conversation by topic instead of by session ID. Reads opencode's SQLite store directly via the `oc-context` CLI (recent / search / show / stats) and uses FTS5 for full-text search across all past message text — no manual markdown notes to maintain.
 ---
 
 # oc-context — Reuse Prior opencode Sessions as Memory
 
-## When to Use This Skill
+## When to Load This Skill
 
-Load this skill whenever:
+Load it eagerly on any of these signals:
 
-- The user references a past conversation by topic, not by session ID
-  ("remember our brave browser desync issue", "we fixed that lambda thing last week").
-- You're starting work in a repository and want a quick digest of what you and the
-  user have done there before, without asking them to repaste context.
-- The user says something like "what have we done in this repo", "find that
-  session about X", "open the one where we set up Y".
-- You're about to ask the user to re-explain something they almost certainly
+- Literal trigger words: **"remember"**, **"last time"**, **"previously"**,
+  **"we discussed"**, **"we fixed"**, **"we set up"**, **"continue"**,
+  **"where did we"**, **"what have we done"**, **"that issue we had"**,
+  **"the one where"**.
+- A user references a past conversation by *topic* without giving a session ID.
+- Starting work in a familiar repository and prior session context would help
+  you answer or act correctly.
+- About to ask the user to re-explain something they almost certainly
   explained in a prior session.
 
-Do **not** load this skill for fresh tasks with no historical context, or when
-the user has already given you enough to start.
+Do **not** load it for fresh tasks where no prior history is implied.
 
 ## What It Does
 
-`oc-context` is a Python CLI (stdlib only) that reads opencode's on-disk session
-storage at `~/.local/share/opencode/storage/` and surfaces:
+`oc-context` is a Python CLI (stdlib only) that reads opencode's SQLite store
+at `~/.local/share/opencode/opencode-stable.db` (auto-detects the newest
+`opencode*.db`) and exposes:
 
-- Per-project session lists with titles, dates, files touched, and diff stats.
-- Regex search across session titles, message summaries, and (optionally) full
-  part text — opencode auto-summarizes each user message and patch, which is
-  usually enough.
-- A per-session "show" view with chronological message summaries.
+- `recent` — most recent sessions, globally or filtered to `$PWD`.
+- `search` — FTS5 full-text search across all message text and reasoning.
+  Auto-builds and incrementally refreshes a sidecar index at
+  `~/.local/share/oc-context/index.db`.
+- `show` — one session's metadata, message summaries, and optionally part text.
+- `stats` — counts and per-directory breakdown.
+- `reindex` — manual reindex / `--full` rebuild.
 
-It is read-only, has no dependencies, and is regenerable from disk. You should
-treat it as a recall tool, not a source of truth — open the relevant
-session(s) in opencode if the user wants to continue them.
-
-## Invocation
-
-The script lives at `~/.agents/skills/oc-context/scripts/oc-context` after
-install. If `~/.agents/skills/oc-context/scripts/` is not on `PATH`, call it
-by absolute path. A common setup is to add a single line to your shell rc:
-
-```sh
-export PATH="$HOME/.agents/skills/oc-context/scripts:$PATH"
-```
-
-(Or symlink the script into `~/.local/bin/`.) The examples below assume
-`oc-context` is on PATH; otherwise substitute the absolute path.
+It is **read-only** against opencode's DB (WAL mode allows concurrent readers)
+and the sidecar index is regenerable from disk. Treat it as recall, not a
+source of truth — to *resume* a session, open opencode and pick the session
+by ID.
 
 ## Quick Reference
 
 ```bash
-oc-context stats                                  # storage summary
-oc-context recent                                 # last 20 sessions, all repos
-oc-context recent --cwd                           # last 20 in current worktree
-oc-context recent --cwd --days 30 -n 5            # last 5 in last 30 days, here
-oc-context search "brave desync"                  # title + summary search
-oc-context search "key.?error" --full             # also scan full message text
-oc-context search "deploy" --cwd                  # scoped to current repo
-oc-context show ses_38723ba86ffeeg5oZuWxdQpqD7    # one session
-oc-context show <id> --parts                      # include part text snippets
-oc-context recent --json                          # machine-readable
+oc-context stats                            # what's there
+oc-context recent                           # last 20 sessions, globally
+oc-context recent --cwd                     # last 20 in current directory
+oc-context recent --cwd --days 14 -n 5      # 5 recent, last 2 weeks, here
+oc-context search "<phrase>"                # FTS5 search
+oc-context search "<word1> <word2>" -n 5    # multi-word phrase OR token match
+oc-context search "<term>" --cwd            # scoped to current directory
+oc-context search "<a> NEAR/3 <b>"          # FTS5 operators
+oc-context show <session_id>                # one session
+oc-context show <session_id> --parts        # include part text
+oc-context reindex                          # incremental refresh
+oc-context reindex --full                   # rebuild from scratch
 ```
 
-All subcommands accept `--json` for downstream tooling.
+All subcommands accept `--json` (machine-readable) and `--db <path>` (override
+the auto-detected source DB).
 
-## How to Use This as an Agent
+## Recommended Agent Usage Patterns
 
-### Pattern 1: explicit recall
+### Pattern 1 — explicit recall (most common)
 
-User says: *"Remember our brave browser desync issue? It came up again."*
+User says: *"Remember our X issue?"* where X is some topic.
 
-1. Run `oc-context search "brave"` (or `"sync"`, or both as alternation
-   `"brave|sync"`).
-2. If no title-level hit, retry with `--full` to scan part text.
-3. Show the top 1-3 hits to the user with session IDs so they can pick.
-4. If exactly one obvious match, fetch `oc-context show <id>` to summarize what
-   was decided, then proceed.
+1. Run `oc-context search "X" --limit 5 --snippets 2`.
+2. If one obvious hit, run `oc-context show <id>` to summarize what was
+   decided.
+3. Report the session ID and a one-paragraph summary to the user before
+   continuing the task.
 
-### Pattern 2: starting in a repo
+### Pattern 2 — recap on entering a repo
 
-User opens a new chat in a repo you have history in.
+Fresh chat in a familiar worktree.
 
-1. Optionally run `oc-context recent --cwd -n 5` once at the start to see the
-   most recent 5 sessions in this worktree.
-2. Only mention them to the user if they're clearly relevant to the new task.
-   Otherwise, just keep them in mind for the conversation.
+1. Optionally run `oc-context recent --cwd -n 5` at the start.
+2. Keep titles in mind. Mention only if clearly relevant to the new task.
 
-### Pattern 3: cross-repo search
+### Pattern 3 — cross-repo discovery
 
-User says: *"Where did we set up that GitHub Actions OIDC thing?"*
+User asks where a topic was discussed without naming a repo.
 
-1. Run `oc-context search "OIDC" --full` (global).
-2. Identify the project from the worktree in the hit.
+1. Run `oc-context search "<topic>" --limit 10`.
+2. Identify which directory from the per-hit metadata.
+
+## Search Tips
+
+- FTS5 syntax is supported: `"exact phrase"`, `term1 OR term2`,
+  `term1 NEAR/3 term2`, prefix matches with `term*`.
+- For plain unquoted multi-word queries, the tool builds both a phrase match
+  and a token OR-match automatically, so `vesper flexoki` finds either word.
+- If FTS5 returns nothing, try shorter queries or different word forms — the
+  tokenizer is `unicode61 remove_diacritics`, no stemming.
+- The search auto-reindexes when the source DB is newer than the index.
+  Use `--no-refresh` for repeated queries on the same snapshot.
 
 ## Heuristics
 
-- Prefer the cheap path first: title + message-summary search. Only add
-  `--full` when no hits, since part text is large.
-- Regex is case-insensitive. For multi-word queries, use space (literal) or
-  alternation (`foo|bar`). Don't quote-escape unless the query has regex
-  metacharacters.
-- Session worktrees can drift if the user renamed a repo on disk; the script
-  groups stats by *project ID* (stable) but search filters by worktree path
-  (current). If a `--cwd` filter returns nothing surprising, drop `--cwd`.
-- Older sessions can have `summary: false` instead of an object. The script
-  handles this; if you see a parse error, it's a bug — file it.
-- `~/.local/share/opencode/opencode*.db` files are **not** session data. They
-  are LSP/symbol caches. Don't touch them.
+- Default to global search. Use `--cwd` only when you're confident the topic
+  was scoped to the current directory.
+- For "recently" / "last time" without a specific topic, prefer
+  `oc-context recent --days 14`.
+- Cite the session ID (`ses_…`) when surfacing results so the user can open
+  it in opencode if they want the full thread.
+- Tokens: snippet output frames matches with `<<…>>`. Treat the highlighted
+  span as the strongest evidence for relevance.
 
 ## Data Layout (Reference)
 
+opencode now stores sessions in SQLite, not JSON-on-disk:
+
 ```
-~/.local/share/opencode/storage/
-├── project/<projectID>.json          # worktree -> projectID mapping
-├── session/<projectID>/ses_*.json    # session: title, slug, time, summary
-├── message/ses_*/msg_*.json          # role, modelID, summary.title, summary.diffs
-└── part/msg_*/prt_*.json             # type ∈ {text, reasoning, tool, patch, step-*, file}
+~/.local/share/opencode/
+├── opencode-stable.db       # active store
+├── opencode.db              # older, possibly stale
+└── storage/                 # legacy JSON layout, mostly frozen
 ```
 
-The script reuses one `walk_sessions()` iterator and one `session_text_blob()`
-loader. A future `semantic` subcommand can plug a vector index on top of the
-same loader without changing the rest of the script.
+Key tables in the DB:
+- `project(id, worktree, …)` — repo / worktree mapping.
+- `session(id, project_id, directory, title, time_updated, summary_*, …)`.
+- `message(id, session_id, data)` — `data` is JSON with `role`, `modelID`, etc.
+- `part(id, message_id, session_id, data)` — `data` is JSON with `type` ∈
+  `{text, reasoning, tool, patch, step-*, file, compaction}`. Text and
+  reasoning parts hold the searchable prose.
+
+The sidecar FTS index at `~/.local/share/oc-context/index.db` mirrors only
+`text` and `reasoning` parts. Tool output and step markers are skipped.
+
+See `references/storage-layout.md` for the full schema dump.
 
 ## Out of Scope
 
-- Editing or deleting sessions. Use opencode's own UI.
-- Resuming a session programmatically. Open it in opencode by ID.
-- Cross-tool history (e.g. Claude Code transcripts in `~/.claude/projects/`).
-  Easy to add as a second reader; not in v0.1.
+- Editing or resuming sessions — use opencode itself.
+- Cross-tool history (Claude Code `~/.claude/projects/*.jsonl`). Easy to add
+  as a second source; not in v0.2.
+- Embeddings / semantic search. FTS5 covers 90% of "remember the X thing"
+  recall at zero setup cost.
 
 ## Privacy
 
-Everything stays local. The script never sends data over the network. Session
-content can include source code, secrets you pasted, and full diffs — treat
-search output like the rest of your shell history.
+Everything stays local. The script makes no network calls. Session content
+includes source code and anything you pasted in past sessions — treat the
+sidecar index with the same care as your shell history.
