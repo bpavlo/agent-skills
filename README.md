@@ -14,6 +14,8 @@ optionally with a `references/` directory.
 
 ## Install
 
+### Via `npx` (skill symlinks)
+
 Symlinks each skill into `~/.agents/skills/<name>` (and `~/.claude/skills/<name>`
 when that directory exists). Requires Node ≥ 18 and `git`.
 
@@ -24,6 +26,22 @@ npx github:bpavlo/agent-skills update               # pull latest
 npx github:bpavlo/agent-skills list
 npx github:bpavlo/agent-skills uninstall [<name>]
 npx github:bpavlo/agent-skills path                 # show install dir
+```
+
+### Via Nix flake (CLI tools)
+
+Some skills ship runnable tools. The flake exposes them as packages:
+
+```sh
+nix run github:bpavlo/agent-skills#oc-context -- stats
+```
+
+Or as a flake input from your own config:
+
+```nix
+inputs.agent-skills.url = "github:bpavlo/agent-skills";
+# then in home.packages:
+inputs.agent-skills.packages.${pkgs.system}.oc-context
 ```
 
 ## License
