@@ -55,5 +55,23 @@
           program = "${oc-context}/bin/oc-context";
         };
       }
-    );
+    )
+    // {
+      # nix-openclaw plugin contract: exposes every top-level skill dir
+      # (any directory containing SKILL.md) plus the oc-context binary.
+      openclawPlugin = system: {
+        name = "agent-skills";
+        skills =
+          let
+            entries = builtins.readDir ./.;
+            isSkill = n: entries.${n} == "directory" && builtins.pathExists (./. + "/${n}/SKILL.md");
+          in
+          map (n: ./. + "/${n}") (builtins.filter isSkill (builtins.attrNames entries));
+        packages = [ self.packages.${system}.oc-context ];
+        needs = {
+          stateDirs = [ ];
+          requiredEnv = [ ];
+        };
+      };
+    };
 }
