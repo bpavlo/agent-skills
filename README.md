@@ -23,7 +23,7 @@ monorepo subdirectory). Provenance and pinned commits: [SOURCES.md](./SOURCES.md
 | [`test-driven-development`](./test-driven-development) | obra/superpowers |
 | [`receiving-code-review`](./receiving-code-review) | obra/superpowers |
 | [`requesting-code-review`](./requesting-code-review) | obra/superpowers |
-| [`karpathy-guidelines`](./karpathy-guidelines) | forrestchang/andrej-karpathy-skills |
+| [`karpathy-guidelines`](./karpathy-guidelines) | multica-ai/andrej-karpathy-skills |
 | [`pulumi-best-practices`](./pulumi-best-practices) | pulumi/agent-skills |
 | [`pulumi-component`](./pulumi-component) | pulumi/agent-skills |
 | [`pulumi-esc`](./pulumi-esc) | pulumi/agent-skills |

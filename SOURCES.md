@@ -11,7 +11,7 @@ subdirectory from the upstream at a newer commit and bump the pin here.
 | test-driven-development | obra/superpowers | skills/test-driven-development | 6fd4507 | repo LICENSE |
 | receiving-code-review | obra/superpowers | skills/receiving-code-review | 6fd4507 | repo LICENSE |
 | requesting-code-review | obra/superpowers | skills/requesting-code-review | 6fd4507 | repo LICENSE |
-| karpathy-guidelines | forrestchang/andrej-karpathy-skills | skills/karpathy-guidelines | 2c60614 | MIT |
+| karpathy-guidelines | multica-ai/andrej-karpathy-skills | skills/karpathy-guidelines | 2c60614 | MIT |
 | pulumi-best-practices | pulumi/agent-skills | pulumi/skills/pulumi-best-practices | 8dccc43 | repo LICENSE |
 | pulumi-component | pulumi/agent-skills | pulumi/skills/pulumi-component | 8dccc43 | repo LICENSE |
 | pulumi-esc | pulumi/agent-skills | pulumi/skills/pulumi-esc | 8dccc43 | repo LICENSE |
